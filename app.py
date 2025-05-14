@@ -1,72 +1,91 @@
+# ------------------------------------------------------
+#  Calendar Preread Assistant  —  Streamlit application
+# ------------------------------------------------------
+"""
+Creates daily prereads for your meetings:
+• pulls Google Calendar events
+• finds latest “Granola” Gmail note for each title
+• sends a single morning briefing via Gmail
+"""
 
-import streamlit as st
-import os
+from __future__ import annotations
+
+import base64
 import datetime as dt
+import email
+import os
+import re
 from pathlib import Path
-from typing import List, Dict
-import openai
+from typing import Dict, List
+import json 
+
+import requests
+import streamlit as st
+from apscheduler.schedulers.background import BackgroundScheduler
 from google_auth_oauthlib.flow import Flow
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from google.oauth2.credentials import Credentials
-from apscheduler.schedulers.background import BackgroundScheduler
-import base64
-import email
-import json
-import yarl
+from openai import OpenAI
 
 # -----------------------------
-# CONFIGURATION
+#  CONFIG & SECRETS
 # -----------------------------
+def secret(key: str, default: str = "") -> str:
+    """Fetch from Streamlit secrets or env var."""
+    return st.secrets.get(key, os.getenv(key, default))
+
+GOOGLE_CLIENT_ID     = secret("google_client_id")
+GOOGLE_CLIENT_SECRET = secret("google_client_secret")
+OPENAI_API_KEY       = secret("openai_api_key")
+REDIRECT_URI         = secret("google_redirect_uri", "http://localhost:8501/auth_callback")
+DAILY_PREREAD_CRON   = secret("daily_preread_cron", "0 6 * * *")   # 06:00 (minute hour)
+
+OPENAI_MODEL = secret("openai_model", "gpt-4o-mini")
+
 SCOPES = [
-    'https://www.googleapis.com/auth/calendar.readonly',
-    'https://www.googleapis.com/auth/gmail.readonly',
-    'https://www.googleapis.com/auth/gmail.send'
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
 ]
 
-# Expect these secrets in your environment or Streamlit secrets
-GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID', '')
-GOOGLE_CLIENT_SECRET = os.getenv('GOOGLE_CLIENT_SECRET', '')
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
-
-# # For Streamlit Cloud put them in .streamlit/secrets.toml
-if 'openai_api_key' in st.secrets:
-    OPENAI_API_KEY = st.secrets['openai_api_key']
-if 'google_client_id' in st.secrets:
-    GOOGLE_CLIENT_ID = st.secrets['google_client_id']
-if 'google_client_secret' in st.secrets:
-    GOOGLE_CLIENT_SECRET = st.secrets['google_client_secret']
-
-openai.api_key = OPENAI_API_KEY
+TOKEN_FILE = Path("token.json")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # -----------------------------
-# AUTH HELPERS
+#  STREAMLIT PAGE CONFIG
 # -----------------------------
-def save_credentials_to_session(creds: Credentials):
-    st.session_state['token'] = creds.to_json()
-
-def get_credentials() -> Credentials | None:
-    if 'token' in st.session_state:
-        return Credentials.from_authorized_user_info(json.loads(st.session_state['token']), SCOPES)
-    token_path = Path('token.json')
-    if token_path.exists():
-        with open(token_path, 'r') as f:
-            return Credentials.from_authorized_user_info(json.load(f), SCOPES)
-    return None
-
-def store_credentials(creds: Credentials):
-    with open('token.json', 'w') as f:
-        f.write(creds.to_json())
-    save_credentials_to_session(creds)
-
-# -------------------- AUTH HELPERS --------------------
-REDIRECT_URI = os.getenv(
-    "GOOGLE_REDIRECT_URI",
-    "http://localhost:8501/auth_callback"      # <- fallback for local dev
+st.set_page_config(
+    page_title="Calendar Preread Assistant",
+    page_icon="📆",
+    layout="wide",
+    menu_items={
+        "Report a bug": "mailto:support@example.com",
+        "About": "Creates daily prereads from your Calendar, Gmail & Granola notes.",
+    },
 )
 
-def login():
-    flow = Flow.from_client_config(
+# -----------------------------
+#  UTILS – CREDENTIAL HANDLING
+# -----------------------------
+def save_credentials(creds: Credentials) -> None:
+    TOKEN_FILE.write_text(creds.to_json())
+    st.session_state["creds"] = creds.to_json()
+
+def load_credentials() -> Credentials | None:
+    if "creds" in st.session_state:
+        return Credentials.from_authorized_user_info(
+            json.loads(st.session_state["creds"]), SCOPES
+        )
+    if TOKEN_FILE.exists():
+        return Credentials.from_authorized_user_info(
+            json.loads(TOKEN_FILE.read_text()), SCOPES
+        )
+    return None
+
+
+def build_flow() -> Flow:
+    return Flow.from_client_config(
         {
             "web": {
                 "client_id": GOOGLE_CLIENT_ID,
@@ -80,268 +99,239 @@ def login():
         redirect_uri=REDIRECT_URI,
     )
 
+def show_login_button() -> None:
+    flow = build_flow()
     auth_url, _ = flow.authorization_url(
         prompt="consent", access_type="offline", include_granted_scopes="true"
     )
-    st.markdown(f"[**Login with Google**]({auth_url})")
+    st.markdown(f"[**🔐 Sign in with Google**]({auth_url})", unsafe_allow_html=True)
 
-def handle_auth_callback():
-    params = st.query_params
-    if "code" not in params:
-        return
-    flow = Flow.from_client_config(
-        {
-            "web": {
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "redirect_uris": [REDIRECT_URI],
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-            }
-        },
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
-    )
-    flow.fetch_token(code=params["code"])
-    creds = flow.credentials
-    store_credentials(creds)
-    st.query_params.clear()          # wipe ?code=...
-    st.rerun()
-
+def handle_auth_callback() -> None:
+    """Capture ?code=… after Google redirects back."""
+    code = st.experimental_get_query_params().get("code")
+    if code:
+        flow = build_flow()
+        flow.fetch_token(code=code[0])
+        save_credentials(flow.credentials)
+        # clear query params
+        st.experimental_set_query_params()
+        st.experimental_rerun()
 
 # -----------------------------
-# DATA FETCHING
+#  GOOGLE  HELPERS
 # -----------------------------
 def fetch_todays_events(creds: Credentials) -> List[Dict]:
-    service = build('calendar', 'v3', credentials=creds)
-    now = dt.datetime.utcnow().isoformat() + 'Z'
-    tomorrow = (dt.datetime.utcnow() + dt.timedelta(days=1)).isoformat() + 'Z'
-    events_result = service.events().list(calendarId='primary', timeMin=now,
-                                          timeMax=tomorrow, singleEvents=True,
-                                          orderBy='startTime').execute()
-    return events_result.get('items', [])
-
-def extract_emails_from_event(event: Dict) -> List[str]:
-    emails = []
-    attendees = event.get('attendees', [])
-    for att in attendees:
-        if att.get('email'):
-            emails.append(att['email'])
-    creator = event.get('creator', {}).get('email')
-    if creator:
-        emails.append(creator)
-    return list(set(emails))
-
-def fetch_threads_for_emails(creds: Credentials, emails: List[str]) -> List[email.message.EmailMessage]:
-    gmail_service = build('gmail', 'v1', credentials=creds)
-    messages = []
-    for mail in emails:
-        try:
-            query = f'from:{mail} OR to:{mail}'
-            resp = gmail_service.users().messages().list(userId='me', q=query, maxResults=10).execute()
-            for msg in resp.get('messages', []):
-                msg_detail = gmail_service.users().messages().get(userId='me', id=msg['id'], format='raw').execute()
-                msg_raw = base64.urlsafe_b64decode(msg_detail['raw'])
-                messages.append(email.message_from_bytes(msg_raw))
-        except HttpError as e:
-            st.error(f'Error fetching Gmail threads: {e}')
-    return messages
-
-def fetch_granola_notes(creds: Credentials, meeting_title: str, email_ids: List[str]) -> str:
-    gmail_service = build('gmail', 'v1', credentials=creds)
-
-    query_parts = [f'"{meeting_title}"', 'Granola']
-    for email in email_ids:
-        query_parts.append(f'from:{email} OR to:{email}')
-    query = ' '.join(query_parts)
-
-    try:
-        results = gmail_service.users().messages().list(
-            userId='me',
-            q=query,
-            maxResults=5,
-            labelIds=["INBOX"]
-        ).execute()
-
-        messages = results.get('messages', [])
-        if not messages:
-            return "No prior Granola notes found."
-
-        # Get the most recent matching message
-        msg_id = messages[0]['id']
-        msg_detail = gmail_service.users().messages().get(
-            userId='me', id=msg_id, format='full'
-        ).execute()
-
-        payload = msg_detail.get('payload', {})
-        parts = payload.get('parts', [])
-        body = ""
-
-        if parts:
-            for part in parts:
-                if part['mimeType'] == 'text/plain':
-                    body = base64.urlsafe_b64decode(part['body']['data']).decode()
-                    break
-        else:
-            body = base64.urlsafe_b64decode(payload['body']['data']).decode()
-
-        # Trim to a reasonable length
-        body = body.strip()
-        if len(body) > 2000:
-            body = body[:2000] + '...'
-
-        return f"Prior Granola Note:\n{body}"
-
-    except Exception as e:
-        return f"⚠️ Error fetching Granola notes: {e}"
-
-
-# -----------------------------
-# SUMMARIZATION
-# -----------------------------
-from openai import OpenAI
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-def summarize_meeting(event: Dict, emails: List[email.message.EmailMessage], granola_notes: str) -> str:
-    start = event['start'].get('dateTime', event['start'].get('date'))
-    attendees = ', '.join(extract_emails_from_event(event))
-    email_snippets = '\n'.join([msg.get('Subject', '') for msg in emails[:5]])
-
-    prompt = f"""You are an executive assistant. Create a concise, actionable preread for the following meeting.
-MEETING TITLE: {event.get('summary')}
-START: {start}
-ATTENDEES: {attendees}
-EMAIL THREAD CONTEXT (subjects only):
-{email_snippets}
-ADDITIONAL NOTES:
-{granola_notes}
-
-Structure the preread in bullets under the headings: Objective, Key Context, Questions / Decisions, Logistics.
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2
+    svc = build("calendar", "v3", credentials=creds)
+    tz = dt.datetime.now().astimezone().tzinfo
+    start = dt.datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    end   = start + dt.timedelta(days=1, microseconds=-1)
+    events = (
+        svc.events()
+        .list(
+            calendarId="primary",
+            timeMin=start.isoformat(),
+            timeMax=end.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+        )
+        .execute()
+        .get("items", [])
     )
-    return response.choices[0].message.content.strip()
+    return events
+
+def extract_emails(event: Dict) -> List[str]:
+    emails = {a.get("email") for a in event.get("attendees", []) if a.get("email")}
+    if event.get("creator", {}).get("email"):
+        emails.add(event["creator"]["email"])
+    return list(emails)
 
 # -----------------------------
-# EMAIL SENDING
+#  GMAIL  HELPERS
 # -----------------------------
-def send_email(creds: Credentials, to_email: str, subject: str, body: str):
+def gmail_service(creds: Credentials):
+    return build("gmail", "v1", credentials=creds)
+
+def latest_granola_note(creds: Credentials, title: str, emails: List[str]) -> str:
+    """Search Gmail for the most recent Granola mail matching the meeting title."""
+    gsvc = gmail_service(creds)
+    query = f"\"{title}\" Granola " + " ".join([f"(from:{e} OR to:{e})" for e in emails])
+    resp = gsvc.users().messages().list(userId="me", q=query, maxResults=1).execute()
+    msgs = resp.get("messages", [])
+    if not msgs:
+        return "No prior Granola notes found."
+
+    msg = gsvc.users().messages().get(userId="me", id=msgs[0]["id"], format="full").execute()
+    payload = msg["payload"]
+    data = None
+    if "parts" in payload:
+        for part in payload["parts"]:
+            if part["mimeType"].startswith("text/plain"):
+                data = part["body"]["data"]
+                break
+    if not data:  # fall back to full body
+        data = payload.get("body", {}).get("data", "")
     try:
-        gmail_service = build("gmail", "v1", credentials=creds)
+        text = base64.urlsafe_b64decode(data).decode()
+    except Exception:
+        text = "[Could not decode note]"
+    return f"Previous Granola Note:\n{text.strip()[:2000]}"
 
-        # If the id_token is missing (offline refresh token flow) call userinfo
-        sender = creds.id_token.get("email") if creds.id_token else None
-        if not sender:
-            oauth2 = build("oauth2", "v2", credentials=creds)
-            sender = oauth2.userinfo().get().execute()["email"]
+def gmail_profile_email(creds: Credentials) -> str:
+    return gmail_service(creds).users().getProfile(userId="me").execute()["emailAddress"]
 
-        msg = email.message.EmailMessage()
-        msg["To"] = to_email or sender
-        msg["From"] = sender
-        msg["Subject"] = subject
-        msg.set_content(body)
-
-        encoded = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-
-        resp = gmail_service.users().messages().send(
-            userId="me", body={"raw": encoded}
-        ).execute()
-
-        st.success(f"✉️  Gmail accepted message id: {resp['id']}")
-        return True
-
-    except HttpError as e:
-        st.error(f"Gmail API error — {e}")
-        return False
-    except Exception as ex:
-        st.error(f"Unexpected error — {ex}")
-        return False
-
-
+def send_email(creds: Credentials, subject: str, body: str, to_addr: str) -> None:
+    gsvc = gmail_service(creds)
+    msg = email.message.EmailMessage()
+    msg["To"] = to_addr
+    msg["From"] = to_addr
+    msg["Subject"] = subject
+    msg.set_content(body)
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    gsvc.users().messages().send(userId="me", body={"raw": raw}).execute()
 
 # -----------------------------
-# DAILY JOB
+#  OPENAI SUMMARISATION
 # -----------------------------
-def daily_preread_job():
-    creds = get_credentials()
-    if not creds:
+def summarise(event: Dict, note: str) -> str:
+    attendees = ", ".join(extract_emails(event))
+    prompt = f"""You are an executive assistant. Create a concise preread.
+
+MEETING: {event.get("summary")}
+WHEN: {event['start'].get('dateTime', event['start'].get('date'))}
+ATTENDEES: {attendees}
+
+{note}
+
+Headings: **Objective**, **Key Context**, **Questions / Decisions**, **Logistics**."""
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content.strip()
+
+# -----------------------------
+#  DAILY JOB
+# -----------------------------
+def daily_preread_job() -> None:
+    creds = load_credentials()
+    if not creds or not creds.valid:
         return
     events = fetch_todays_events(creds)
-    st.write(f"📅 fetched {len(events)} events")
     summaries = []
     for ev in events:
-        emails = fetch_threads_for_emails(creds, extract_emails_from_event(ev))
-        granola_notes = fetch_granola_notes(creds, ev.get("summary", ""), extract_emails_from_event(ev))
-        summaries.append(summarize_meeting(ev, emails, granola_notes))
+        note = latest_granola_note(creds, ev.get("summary", ""), extract_emails(ev))
+        summaries.append(summarise(ev, note))
+
+    sender = gmail_profile_email(creds)
+    if summaries:
+        body = "\n\n---\n\n".join(summaries)
+        subject = "Daily Meeting Prereads"
+    else:
+        body = "You're all clear today! 🎉\n\nNo meetings were found on your calendar."
+        subject = "No Meetings Today 😊"
+
     try:
-        # Determine who to send to
-        # sender = creds.id_token.get("email") if creds.id_token else None
-        sender = None
-        # if not sender:
-        #     oauth2 = build("oauth2", "v2", credentials=creds)
-        #     sender = oauth2.userinfo().get().execute()["email"]
-        if not sender:
-            profile = build("gmail", "v1", credentials=creds).users().getProfile(userId="me").execute()
-            sender = profile.get("emailAddress")
-
-
-        if summaries:
-            body = "\n\n---\n\n".join(summaries)
-            subject = "Daily Meeting Prereads"
-        else:
-            body = (
-                "You're all clear today! 🎉\n\n"
-                "No meetings were found on your calendar.\n"
-                "Enjoy your day!"
-            )
-            subject = "No Meetings Today 😊"
-
-        send_email(creds, sender, subject, body)
-        st.success(f"✅ Email sent: {subject}")
-
-    except Exception as e:
-        st.error(f"Error while sending email: {e}")
-
-
-# Kick off scheduler once per session
-if 'scheduler_started' not in st.session_state:
-    sched = BackgroundScheduler()
-    # Run every day at 06:00 local server time
-    sched.add_job(daily_preread_job, 'cron', hour=6, minute=0)
-    sched.start()
-    st.session_state['scheduler_started'] = True
+        send_email(creds, subject, body, sender)
+        st.sidebar.success(f"Sent email: {subject}")
+    except HttpError as e:
+        st.sidebar.error(f"Gmail API error — {e}")
 
 # -----------------------------
-# STREAMLIT UI
+#  SCHEDULER (fire once)
 # -----------------------------
-st.set_page_config(page_title='Calendar Preread Assistant', page_icon='📆')
-st.title('📆 Calendar Preread Assistant')
+if "sched" not in st.session_state:
+    cron_min, cron_hour, *_ = DAILY_PREREAD_CRON.split()
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(daily_preread_job, "cron", hour=cron_hour, minute=cron_min)
+    scheduler.start()
+    st.session_state["sched"] = True
 
+# -----------------------------
+#  AUTH FLOW
+# -----------------------------
 handle_auth_callback()
-creds = get_credentials()
-if not creds or not creds.valid:
-    login()
-    st.stop()
+creds = load_credentials()
 
-st.success('✅ Logged in successfully!')
+# -----------------------------
+#  SIDEBAR
+# -----------------------------
+with st.sidebar:
+    st.title("Preread Assistant")
+    st.caption("AI‑powered briefing generator")
 
-if st.button('Run daily preread job now'):
-    daily_preread_job()
-    st.success('Sent!')
+    if creds and creds.valid:
+        st.success(f"Signed in as **{gmail_profile_email(creds)}**")
+        if st.button("↻ Run preread now", use_container_width=True):
+            daily_preread_job()
+    else:
+        show_login_button()
 
-# Display todays events + prereads in the UI
-events = fetch_todays_events(creds)
-for ev in events:
-    st.subheader(ev.get('summary', 'No Title'))
-    with st.expander('Details'):
-        st.json(ev)
-    emails = fetch_threads_for_emails(creds, extract_emails_from_event(ev))
-    granola = fetch_granola_notes(creds, ev.get("summary", ""), extract_emails_from_event(ev))
-    summary = summarize_meeting(ev, emails, granola)
-    st.markdown(summary)
-# placeholder code, see chat
+    st.markdown("---")
+    st.subheader("Schedule")
+    current_time = dt.time(hour=int(DAILY_PREREAD_CRON.split()[1]),
+                           minute=int(DAILY_PREREAD_CRON.split()[0]))
+    st.time_input("Daily e‑mail (server TZ)", current_time, disabled=True)
+    st.caption("Change via `daily_preread_cron` secret.")
+    st.markdown("---")
+    st.caption("© 2025 Your Company")
+
+# -----------------------------
+#  MAIN TABS
+# -----------------------------
+tab_prev, tab_events, tab_about = st.tabs(
+    ["📨  Inbox Preview", "📅 Today's Events", "ℹ️ About"]
+)
+
+with tab_prev:
+    st.header("Upcoming briefing")
+    if not creds or not creds.valid:
+        st.info("Please sign in to preview your briefing.")
+    else:
+        evs = fetch_todays_events(creds)
+        if not evs:
+            st.info("🎉 No meetings today!")
+        else:
+            with st.spinner("Generating preview…"):
+                previews = []
+                for ev in evs:
+                    note = latest_granola_note(creds, ev.get("summary", ""), extract_emails(ev))
+                    previews.append(summarise(ev, note))
+                st.markdown("\n\n---\n\n".join(previews))
+
+with tab_events:
+    st.header("Today's meetings")
+    if not creds or not creds.valid:
+        st.info("Please sign in to view events.")
+    else:
+        events = fetch_todays_events(creds)
+        if not events:
+            st.info("No events found.")
+        else:
+            for ev in events:
+                with st.container(border=True):
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.subheader(ev.get("summary", "Untitled"))
+                        start = ev["start"].get("dateTime", ev["start"].get("date"))
+                        st.write(f"🕒 {start}")
+                        st.write(f"👥 {', '.join(extract_emails(ev))}")
+                    with col2:
+                        if st.button("Preview ➜", key=ev["id"]):
+                            note = latest_granola_note(creds, ev.get("summary", ""), extract_emails(ev))
+                            st.markdown(summarise(ev, note))
+
+with tab_about:
+    st.header("About this app")
+    st.write(
+        """
+**Calendar Preread Assistant** automatically crafts and e‑mails a succinct
+bullet‑point brief for each of your meetings, using:
+
+* Google Calendar (to list events)
+* Gmail (threads + latest Granola e‑mail)
+* OpenAI GPT‑4o for summarisation
+
+Source code is open‑source — PRs welcome!
+"""
+    )
