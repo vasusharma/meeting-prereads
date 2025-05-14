@@ -14,8 +14,8 @@
 ## 🚀 Quick start (local)
 
 ```bash
-git clone https://github.com/<you>/calendar_preread_repo.git
-cd calendar_preread_repo
+git clone https://github.com/<you>/meeting-prereads.git.git
+cd meeting-prereads.git
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
@@ -42,12 +42,3 @@ openai_api_key="<openai>"
 
 3. Set the app URL as an Authorised redirect URI for your Google OAuth client.
 
-## Customising
-
-* Change the scheduler time in `app.py` (`BackgroundScheduler` cron job).
-* Replace the placeholder `fetch_granola_notes()` with actual API logic.
-* Tweak the OpenAI prompt in `summarize_meeting()` if you prefer a different preread format.
-
-## Security
-
-Do **not** hard‑code API keys. Use environment variables or Streamlit secrets.
